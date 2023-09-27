@@ -1,0 +1,7 @@
+langchain
+openai
+streamlit
+streamlit-chat
+deeplake
+faiss-cpu
+tiktoken
