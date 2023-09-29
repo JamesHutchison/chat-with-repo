@@ -5,3 +5,5 @@ streamlit-chat
 deeplake
 faiss-cpu
 tiktoken
+ooba-api-client
+transformers

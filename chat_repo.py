@@ -2,6 +2,8 @@ import functools
 import pickle
 import os
 from pathlib import Path
+import textwrap
+from typing import Any
 from langchain.document_loaders import TextLoader
 from langchain.text_splitter import (
     CharacterTextSplitter,
@@ -9,20 +11,33 @@ from langchain.text_splitter import (
 )
 from langchain.schema import Document
 from langchain.chat_models import ChatOpenAI
+from langchain.llms.textgen import TextGen
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.vectorstores import DeepLake
 import streamlit as st
 from langchain.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
+from langchain.schema.messages import SystemMessage, HumanMessage
+from ooba_api import LlamaInstructPrompt, OobaApiClient, Parameters
+from langchain.chains.llm import LLMChain
+from langchain.chains.combine_documents.stuff import StuffDocumentsChain
 
 import langchain
+
+from ooba_langchain import BlockingLangChainOobaLLM
 
 CACHE_DIR = Path(".repo_chat")
 CACHE_FILE = CACHE_DIR / "docs.pickle"
 
-DIR_LIST = ["add_dirs_here"]
-FILE_EXTENSIONS = {"ts", "tsx", "py", "json", "js", "jsx", "html", "md", "css"}
+DIR_LIST = ['fill me in']
+# TODO: add command line arguments for file types
+# TODO: add way to filter by file type at query time
+# FILE_EXTENSIONS = {"ts", "tsx", "py", "json", "js", "jsx", "html", "md", "css"}
+FILE_EXTENSIONS = {"py", "ts", "tsx", "js", "jsx", "html", "css"}
 
+# TODO: some better way
+USE_LLAMA_INSTRUCT = True
 
 langchain.debug = True
 
@@ -33,6 +48,7 @@ embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
 
 @functools.lru_cache(1)
 def get_deeplake_db():
+    print("using deeplake vectorstore")
     my_activeloop_org_id = "your-org-id"
     my_activeloop_dataset_name = "your-dataset-name"
     dataset_path = f"hub://{my_activeloop_org_id}/{my_activeloop_dataset_name}"
@@ -79,12 +95,11 @@ def do_load(db) -> None:
                 if extension in ("md", "css"):
                     splitter_extension = None
 
-                # loader = RecursiveCharacterTextSplitter(file_path, encoding="utf-8")
-                # docs.extend(loader.load_and_split())
                 CHUNK_SIZE = 1000
+                CHUNK_OVERLAP = 100
                 if splitter_extension:
                     text_splitter = RecursiveCharacterTextSplitter.from_language(
-                        splitter_extension, chunk_size=CHUNK_SIZE
+                        splitter_extension, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
                     )
                 else:
                     text_splitter = CharacterTextSplitter(
@@ -96,11 +111,6 @@ def do_load(db) -> None:
                     )
                 )
                 print(f"Num docs: {len(docs)}")
-
-    # from langchain.text_splitter import CharacterTextSplitter
-
-    # text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    # splitted_text = text_splitter.split_documents(docs)
 
     print("Loading documents...")
     cache_docs(docs)
@@ -123,22 +133,140 @@ def do_load_of_cached_embeddings(db):
 
 
 @st.cache_resource()
-def do_load_in_memory(db):
+def do_load_in_memory():
+    print("Using in-memory vectorstore")
+    db = in_memory_vectorstore()
     if Path(CACHE_DIR).exists():
+        print("Loading cached embeddings. Run with '--clear-cache' to recompute.")
         do_load_of_cached_embeddings(db)
     else:
+        print("Loading with fresh embeddings. This will use the OpenAI embeddings API.")
         do_load(db)
 
 
-def do_streamlit(in_memory: bool) -> None:
+# TODO: this is from map reduce, which is no longer happening. Remove?
+@functools.lru_cache(1)
+def question_prompt() -> PromptTemplate:
+    question_prompt_template = """Use the following portion of code from the source file to answer the question.
+    Return all text verbatim. Include the path. Include portions around it necessary for context.
+    Consider whether the user is looking for code, documentation, or sample files when deciding relevance. Do not provide advice.
+    Do not speak to the user, only return maybe relevant code snippets. If it is completely irrelevant, return "no code snippets".
+
+    EXAMPLE output, code is absolutely not relevant:
+    no code snippets
+
+    EXAMPLE output, code is maybe relevant:
+
+    `./app/users/get.py`
+    ```python
+    def retrieve_user(request):
+        return Users.get(request.post['id'])
+    ```
+
+    `./app/urls.py`
+    ```python
+    user_url = "http://localhost/users/<id:int>"
+    ```
+    ```python
+    class Users:
+        url = user_url
+        def get(self, request):
+            return retrieve_user(request).to_output()
+    ```
+
+    CONTEXT:
+    {context}
+    Question: {question}
+    Relevant text or code, if any:"""
+    if USE_LLAMA_INSTRUCT:
+        question_prompt_template = LlamaInstructPrompt(
+            system_prompt="Do not give the user advice. Only return relevant code snippets that may help with answering the question.",
+            prompt=question_prompt_template,
+        ).full_prompt()
+    return PromptTemplate(
+        template=textwrap.dedent(question_prompt_template),
+        input_variables=["context", "question"],
+    )
+
+
+def combine_prompt() -> PromptTemplate:
+    combine_prompt_template = """Given the following code files exerpts, answer the question the best you can.
+    Provide many possible answers, but prioritize the best. Consider whether the file is for testing
+    purposes or not. Return entire functions if you can. Always indicate the paths to the source files.
+    Include relevant code snippets necessary for context. Do not give the user general advice, only
+    specific answers. If you don't know the answer, don't try to make up an answer.
+    Only consider responses from the given sources and context.
+
+    QUESTION: {question}
+    =========
+    {summaries}
+    =========
+    SEARCH RESULTS:"""
+    if USE_LLAMA_INSTRUCT:
+        combine_prompt_template = LlamaInstructPrompt(
+            system_prompt="Do not give the user advice. Only return relevant code snippets that may help with answering the question.",
+            prompt=combine_prompt_template,
+        ).full_prompt()
+    return PromptTemplate(
+        template=textwrap.dedent(combine_prompt_template),
+        input_variables=["summaries", "question"],
+    )
+
+
+class RetrievalQAWithSourcesChainWithPathInDoc(RetrievalQAWithSourcesChain):
+    _query_override: str | None = None
+
+    @property
+    def query_override(self) -> str:
+        return self._query_override
+
+    @query_override.setter
+    def query_override(self, value: str | None) -> None:
+        self._query_override = value
+
+    def get_relevant_documents(
+        self,
+        query: str,
+        *,
+        callbacks=None,
+        tags: list[str] = None,
+        metadata: dict[str, Any] | None = None,
+        run_name: str | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        query = self._query_override or query
+        return super().get_relevant_documents(
+            query,
+            callbacks=callbacks,
+            tags=tags,
+            metadata=metadata,
+            run_name=run_name,
+            **kwargs,
+        )
+
+    def _get_docs(self, inputs: dict[str, Any], *, run_manager):
+        """
+        Add the source path to the page_content of each document.
+        """
+        result = super()._get_docs(inputs, run_manager=run_manager)
+        for doc in result:
+            doc.page_content = f"from {doc.metadata['source']}:\n" + doc.page_content
+        return result
+
+
+def do_streamlit(
+    in_memory: bool, use_ooba: bool, ooba_url: str, no_load: bool, gpt_4: bool
+) -> None:
     from streamlit_chat import message
 
+    if use_ooba and gpt_4:
+        raise Exception("Cannot specify both ooba and gpt-4")
+
     if in_memory:
-        print("Using in-memory vectorstore")
         db = in_memory_vectorstore()
-        do_load_in_memory(db)
+        if not no_load:
+            do_load_in_memory()
     else:
-        print("using deeplake vectorstore")
         db = get_deeplake_db()
     retriever = db.as_retriever()
 
@@ -149,16 +277,34 @@ def do_streamlit(in_memory: bool) -> None:
     retriever.search_kwargs["k"] = 10
 
     # Create a ChatOpenAI model instance
-    # model = ChatOpenAI(model_name="gpt-4")
-    model = ChatOpenAI()
+    if use_ooba:
+        ooba_client = OobaApiClient(ooba_url)
+        llm = BlockingLangChainOobaLLM(
+            base_prompt=LlamaInstructPrompt(
+                system_prompt="Do not give the user advice. Only return relevant code snippets that may help with answering the question.",
+                prompt="",
+            ),
+            api_client=ooba_client,
+            parameters=Parameters(temperature=0.1, max_new_tokens=750),
+        )
+    else:
+        if gpt_4:
+            llm = ChatOpenAI(model_name="gpt-4")
+        else:
+            llm = ChatOpenAI()  # gpt-3-turbo
 
-    # Create a RetrievalQA instance from the model and retriever
-    qa_chain = RetrievalQAWithSourcesChain.from_llm(model, retriever=retriever)
-
-    # Return the result of the query
-    # qa.run("What is the repository's name?")
-
-    # pip install streamlit streamlit_chat
+    llm_combine_chain = LLMChain(llm=llm, prompt=combine_prompt())
+    combine_documents_chain = StuffDocumentsChain(
+        llm_chain=llm_combine_chain,
+        document_prompt=PromptTemplate(
+            template="Content: {page_content}\nSource: {source}",
+            input_variables=["page_content", "source"],
+        ),
+        document_variable_name="summaries",
+    )
+    qa_chain = RetrievalQAWithSourcesChainWithPathInDoc(
+        combine_documents_chain=combine_documents_chain, retriever=retriever
+    )
 
     # Set the title for the Streamlit app
     st.title(f"Chat with Code Repository")
@@ -173,21 +319,60 @@ def do_streamlit(in_memory: bool) -> None:
     chat_history_container = st.container()
 
     # A field input to receive user queries
-    user_input = st.text_input("", key="input")
+    user_input = st.text_area("", key="input")
+
+    user_input_modified = (
+        user_input
+        + " Be sure to include neighboring context that is required to know why it is relevant."
+    )
+    user_input_modified += (
+        "\nProvide thorough explanations of how to accomplish anything and also relevant code snippets "
+        "and file paths from relevant source files. Be sure to include neighboring context that "
+        "is required to know why it is relevant."
+    )
     send = st.button("Send")
 
     with chat_history_container:
         # Search the databse and add the responses to state
         if send and user_input:
-            output = qa_chain(user_input, return_only_outputs=True)
+            if use_ooba:
+                vector_search_prompt = ooba_client.instruct(
+                    LlamaInstructPrompt(
+                        system_prompt="Convert the following user prompt into a query suitable for vector search",
+                        prompt=user_input,
+                    )
+                )
+            else:
+                vector_search_prompt = llm(
+                    [
+                        SystemMessage(
+                            content="Convert the following user prompt into a query suitable for vector search"
+                        ),
+                        HumanMessage(content=user_input),
+                    ]
+                ).content
+            RetrievalQAWithSourcesChainWithPathInDoc.query_override = (
+                vector_search_prompt
+            )
+
+            output = qa_chain(user_input_modified, return_only_outputs=True)
+            answer = output["answer"]
             st.session_state.past.append(user_input)
-            st.session_state.generated.append(output)
+            st.session_state.generated.append(answer)
 
         # Create the conversational UI using the previous states
         if st.session_state["generated"]:
             for i in range(len(st.session_state["generated"])):
                 message(st.session_state["past"][i], is_user=True, key=str(i) + "_user")
                 message(st.session_state["generated"][i], key=str(i))
+
+
+@st.cache_resource()
+def clear_cache() -> None:
+    if CACHE_DIR.exists():
+        for file in CACHE_DIR.iterdir():
+            file.unlink()
+        CACHE_DIR.rmdir()
 
 
 if __name__ == "__main__":
@@ -197,15 +382,21 @@ if __name__ == "__main__":
     parser.add_argument("--load-deeplake", action="store_true")
     parser.add_argument("--in-memory", action="store_true")
     parser.add_argument("--clear-cache", action="store_true")
+    parser.add_argument("--use-ooba", action="store_true")
+    parser.add_argument("--ooba-url", type=str, default="http://localhost:8000")
+    parser.add_argument(
+        "--no-load",
+        action="store_true",
+        help="Disable loading embeddings into the in-memory vector database.",
+    )
+    parser.add_argument("--gpt-4", action="store_true")
     args = parser.parse_args()
 
     if args.clear_cache:
-        if CACHE_DIR.exists():
-            for file in CACHE_DIR.iterdir():
-                file.unlink()
-        CACHE_DIR.rmdir()
-
+        clear_cache()
     if args.load_deeplake:
         do_load(in_memory=False)
     else:
-        do_streamlit(args.in_memory)
+        do_streamlit(
+            args.in_memory, args.use_ooba, args.ooba_url, args.no_load, args.gpt_4
+        )
