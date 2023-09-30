@@ -255,13 +255,15 @@ class RetrievalQAWithSourcesChainWithPathInDoc(RetrievalQAWithSourcesChain):
 
 
 def do_streamlit(
-    in_memory: bool, use_ooba: bool, ooba_url: str, no_load: bool, gpt_4: bool
+    in_memory: bool, no_load: bool, llm_strategy: dict
 ) -> None:
     from streamlit_chat import message
 
-    if use_ooba and gpt_4:
-        raise Exception("Cannot specify both ooba and gpt-4")
-
+    use_ooba = llm_strategy['primary_llm'] == 'ooba'
+    if not use_ooba:
+        use_open_ai = True
+    else:
+        use_open_ai = False
     if in_memory:
         db = in_memory_vectorstore()
         if not no_load:
@@ -288,10 +290,10 @@ def do_streamlit(
             parameters=Parameters(temperature=0.1, max_new_tokens=750),
         )
     else:
-        if gpt_4:
-            llm = ChatOpenAI(model_name="gpt-4")
+        if use_open_ai:
+            llm = ChatOpenAI(model_name=llm_strategy['primary_llm'])
         else:
-            llm = ChatOpenAI()  # gpt-3-turbo
+            raise Exception("No LLM specified!")
 
     llm_combine_chain = LLMChain(llm=llm, prompt=combine_prompt())
     combine_documents_chain = StuffDocumentsChain(
@@ -375,6 +377,25 @@ def clear_cache() -> None:
         CACHE_DIR.rmdir()
 
 
+def get_llm_strategy(use_ooba: bool, ooba_url: str, use_gpt3: bool, use_gpt4: bool):
+    more_kwargs = {}
+    
+    selection_count = sum([use_ooba, use_gpt3, use_gpt4]):
+    if selection_count != 1:
+        raise Exception("Specify one of --use-ooba, --gpt-3, --gpt-4")
+
+    if use_gpt3:
+        primary_llm = "gpt-3-turbo"
+    elif use_gpt4:
+        primary_llm = "gpt-4"
+    elif use_ooba:
+        primary_llm = "ooba"
+        more_kwargs["ooba_url"] = ooba_url
+    return {
+        "primary_llm": primary_llm,
+    } | more_kwargs
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -382,14 +403,15 @@ if __name__ == "__main__":
     parser.add_argument("--load-deeplake", action="store_true")
     parser.add_argument("--in-memory", action="store_true")
     parser.add_argument("--clear-cache", action="store_true")
-    parser.add_argument("--use-ooba", action="store_true")
-    parser.add_argument("--ooba-url", type=str, default="http://localhost:8000")
+    parser.add_argument("--ooba-url", type=str, default="http://localhost:8000", help="URL for --use-ooba")
     parser.add_argument(
         "--no-load",
         action="store_true",
         help="Disable loading embeddings into the in-memory vector database.",
     )
-    parser.add_argument("--gpt-4", action="store_true")
+    parser.add_argument("--gpt-3", action="store_true", help="Use GPT-3")
+    parser.add_argument("--gpt-4", action="store_true", help="Use GPT-4")
+    parser.add_argument("--use-ooba", action="store_true", help="Use Ooba-booga's Text Gen Web UI")
     args = parser.parse_args()
 
     if args.clear_cache:
@@ -398,5 +420,5 @@ if __name__ == "__main__":
         do_load(in_memory=False)
     else:
         do_streamlit(
-            args.in_memory, args.use_ooba, args.ooba_url, args.no_load, args.gpt_4
+            args.in_memory, args.no_load, get_llm_strategy(args.use_ooba, args.ooba_url, args.gpt_3, args.gpt_4)
         )
