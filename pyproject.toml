@@ -1,0 +1,37 @@
+[tool.ruff]
+# hard limit, error here
+line-length = 120
+
+[tool.black]
+# soft limit, wrap just before 100 chars
+line-length = 98
+
+[tool.poetry]
+name = "chat-with-repo"
+version = "0.1.0"
+description = ""
+authors = ["James Hutchison <JamesGHutchison@proton.me>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+langchain = "^0.0.309"
+openai = "^0.28.1"
+streamlit = "^1.27.2"
+streamlit-chat = "^0.1.1"
+deeplake = "^3.7.3"
+faiss-cpu = "^1.7.4"
+tiktoken = "^0.5.1"
+ooba-api-client = "^0.1.0a4"
+transformers = "^4.34.0"
+
+
+[tool.poetry.group.dev.dependencies]
+mypy = "^1.5.1"
+ruff = "^0.0.292"
+black = "^23.9.1"
+pytest = "^7.4.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
